@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>음성 → 텍스트 → 영어 번역</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", sans-serif;
+    margin: 0; padding: 24px; background: #0f1115; color: #e8eaed;
+    display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 720px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #9aa0a6; margin-bottom: 20px; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  button {
+    border: 0; border-radius: 8px; padding: 10px 18px; font-size: 14px;
+    font-weight: 600; cursor: pointer; transition: .15s;
+  }
+  #mic { background: #2f6feb; color: #fff; }
+  #mic.rec { background: #d93025; animation: pulse 1.2s infinite; }
+  #clear { background: #2a2e35; color: #e8eaed; }
+  button:disabled { opacity: .45; cursor: not-allowed; animation: none; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  select {
+    background: #2a2e35; color: #e8eaed; border: 1px solid #3c4149;
+    border-radius: 8px; padding: 9px 10px; font-size: 14px;
+  }
+  .status { font-size: 12px; color: #9aa0a6; margin-left: auto; }
+  .panel { background: #181b20; border: 1px solid #2a2e35; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+  .label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #7c838d; margin-bottom: 8px; }
+  .text { font-size: 16px; line-height: 1.7; min-height: 56px; white-space: pre-wrap; word-break: break-word; }
+  .interim { color: #6f7680; font-style: italic; }
+  #out { color: #7ee2a8; }
+  .note { font-size: 12px; color: #7c838d; line-height: 1.6; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #2a2e35; color: #9aa0a6; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>음성 → 텍스트 → 영어 번역</h1>
+  <div class="sub">외부 API 호출 없음 · 브라우저 내장 엔진만 사용</div>
+
+  <div class="bar">
+    <button id="mic">🎤 녹음 시작</button>
+    <button id="clear">지우기</button>
+    <select id="lang">
+      <option value="ko-KR">한국어</option>
+      <option value="ja-JP">일본어</option>
+      <option value="es-ES">스페인어</option>
+      <option value="fr-FR">프랑스어</option>
+      <option value="zh-CN">중국어(간체)</option>
+    </select>
+    <span class="status" id="status">대기 중</span>
+  </div>
+
+  <div class="panel">
+    <div class="label">인식된 음성 (원문)</div>
+    <div class="text" id="src"></div>
+  </div>
+
+  <div class="panel">
+    <div class="label">영어 번역 <span class="badge" id="engine">-</span></div>
+    <div class="text" id="out"></div>
+  </div>
+
+  <div class="note">
+    <b>번역 엔진 우선순위</b><br>
+    1. Chrome 138+ 내장 <code>Translator API</code> — 모델이 기기에 다운로드되어 오프라인 동작<br>
+    2. 미지원 시 내장 사전 폴백 — 단어·관용구 수준만 번역<br>
+    마이크 권한이 필요하며, <code>https</code> 또는 <code>localhost</code>에서만 동작합니다.
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const micBtn = $('mic'), clearBtn = $('clear'), langSel = $('lang');
+  const srcEl = $('src'), outEl = $('out'), statusEl = $('status'), engineEl = $('engine');
+
+  /* ---------- 1. 음성 인식 (Web Speech API) ---------- */
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    statusEl.textContent = '이 브라우저는 음성 인식을 지원하지 않습니다';
+    micBtn.disabled = true;
+  }
+
+  let recog = null, recording = false, finalText = '';
+
+  function buildRecognizer() {
+    const r = new SR();
+    r.lang = langSel.value;
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+
+    r.onstart = () => { statusEl.textContent = '듣는 중...'; };
+
+    r.onresult = e => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t + ' ';
+        else interim += t;
+      }
+      srcEl.innerHTML = escapeHtml(finalText) +
+        (interim ? '<span class="interim">' + escapeHtml(interim) + '</span>' : '');
+      if (finalText.trim()) translate(finalText.trim());
+    };
+
+    r.onerror = e => {
+      statusEl.textContent = '오류: ' + e.error;
+      if (e.error === 'not-allowed') stop();
+    };
+
+    r.onend = () => { if (recording) r.start(); else statusEl.textContent = '정지됨'; };
+    return r;
+  }
+
+  function start() {
+    finalText = ''; srcEl.textContent = ''; outEl.textContent = '';
+    recog = buildRecognizer();
+    recording = true;
+    micBtn.textContent = '■ 녹음 중지';
+    micBtn.classList.add('rec');
+    recog.start();
+  }
+
+  function stop() {
+    recording = false;
+    micBtn.textContent = '🎤 녹음 시작';
+    micBtn.classList.remove('rec');
+    if (recog) recog.stop();
+  }
+
+  micBtn.onclick = () => recording ? stop() : start();
+  clearBtn.onclick = () => { finalText = ''; srcEl.textContent = ''; outEl.textContent = ''; engineEl.textContent = '-'; };
+  langSel.onchange = () => { if (recording) { stop(); setTimeout(start, 300); } };
+
+  /* ---------- 2. 번역 ---------- */
+  let translator = null, translatorKey = null;
+
+  async function getTranslator(srcLang) {
+    if (!('Translator' in self)) return null;
+    if (translator && translatorKey === srcLang) return translator;
+    try {
+      const avail = await Translator.availability({ sourceLanguage: srcLang, targetLanguage: 'en' });
+      if (avail === 'unavailable') return null;
+      statusEl.textContent = avail === 'available' ? '번역 중...' : '번역 모델 다운로드 중...';
+      translator = await Translator.create({
+        sourceLanguage: srcLang,
+        targetLanguage: 'en',
+        monitor(m) {
+          m.addEventListener('downloadprogress', e => {
+            statusEl.textContent = `모델 ${Math.round(e.loaded * 100)}%`;
+          });
+        }
+      });
+      translatorKey = srcLang;
+      return translator;
+    } catch (_) { return null; }
+  }
+
+  let seq = 0;
+  async function translate(text) {
+    const my = ++seq;
+    const srcLang = langSel.value.split('-')[0];
+    const t = await getTranslator(srcLang);
+    if (my !== seq) return;
+
+    if (t) {
+      try {
+        const res = await t.translate(text);
+        if (my !== seq) return;
+        outEl.textContent = res;
+        engineEl.textContent = '내장 Translator';
+        statusEl.textContent = recording ? '듣는 중...' : '완료';
+        return;
+      } catch (_) {}
+    }
+    outEl.textContent = dictTranslate(text);
+    engineEl.textContent = '사전 폴백';
+  }
+
+  /* ---------- 3. 내장 사전 폴백 (한국어 한정, 단어/관용구) ---------- */
+  const PHRASES = [
+    ['안녕하세요', 'Hello'], ['안녕히 가세요', 'Goodbye'], ['감사합니다', 'Thank you'],
+    ['고맙습니다', 'Thank you'], ['죄송합니다', "I'm sorry"], ['미안해', "I'm sorry"],
+    ['반갑습니다', 'Nice to meet you'], ['잘 지냈어요', 'How have you been'],
+    ['이름이 뭐예요', 'What is your name'], ['도와주세요', 'Please help me'],
+    ['얼마예요', 'How much is it'], ['어디예요', 'Where is it'], ['잠시만요', 'Just a moment'],
+    ['알겠습니다', 'I understand'], ['모르겠어요', "I don't know"], ['좋아요', 'Good'],
+    ['괜찮아요', "It's okay"], ['화장실', 'restroom'], ['오늘 날씨', "today's weather"]
+  ];
+  const WORDS = {
+    '나':'I','저':'I','너':'you','당신':'you','우리':'we','그':'he','그녀':'she',
+    '물':'water','밥':'rice','음식':'food','커피':'coffee','집':'home','학교':'school',
+    '회사':'company','친구':'friend','가족':'family','시간':'time','오늘':'today',
+    '내일':'tomorrow','어제':'yesterday','지금':'now','사랑':'love','책':'book',
+    '컴퓨터':'computer','전화':'phone','사람':'person','하나':'one','둘':'two','셋':'three'
+  };
+
+  function dictTranslate(text) {
+    let s = text;
+    for (const [k, v] of PHRASES) s = s.split(k).join(` ${v} `);
+    for (const [k, v] of Object.entries(WORDS)) s = s.split(k).join(` ${v} `);
+    s = s.replace(/[가-힣]+/g, m => `[${m}]`).replace(/\s+/g, ' ').trim();
+    return s + '\n\n※ 사전 폴백 모드: [대괄호]는 미번역 구간입니다.';
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+  }
+})();
+</script>
+</body>
+</html>
